@@ -19,6 +19,7 @@ use vulkano_taskgraph::{Id, Task};
 use vulkano_taskgraph::QueueFamilyType;
 use vulkano_taskgraph::resource::{AccessTypes, Resources, ResourcesCreateInfo};
 use vulkano_taskgraph::graph::{CompileInfo, TaskGraph};
+use half::f16;
 
 // 1. Define the compute shaders (GLSL source embedded and compiled at build time)
 mod cs_matmul {
@@ -46,6 +47,32 @@ mod cs_matmul {
         "#,
     }
 }
+mod cs_matmul_f16 {
+    vulkano_shaders::shader!{
+        ty: "compute",
+        src: r#"
+        #version 450
+        #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+        #extension GL_EXT_shader_16bit_storage : require
+        layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+        layout(push_constant) uniform Params { uint M; uint N; uint K; } params;
+        layout(set = 0, binding = 0) readonly buffer A { float16_t a[]; } bufA;
+        layout(set = 0, binding = 1) readonly buffer B { float16_t b[]; } bufB;
+        layout(set = 0, binding = 2) writeonly buffer C { float16_t c[]; } bufC;
+        void main() {
+            uint row = gl_GlobalInvocationID.x;
+            uint col = gl_GlobalInvocationID.y;
+            if(row < params.M && col < params.N) {
+                float16_t sum = float16_t(0.0);
+                for(uint k = 0; k < params.K; ++k) {
+                    sum += bufA.a[row * params.K + k] * bufB.b[k * params.N + col];
+                }
+                bufC.c[row * params.N + col] = sum;
+            }
+        }
+        "#,
+    }
+}
 mod cs_activate {
     vulkano_shaders::shader!{
         ty: "compute",
@@ -61,6 +88,27 @@ mod cs_activate {
                 float val = bufIn.x[idx];
                 // Example activation: ReLU (threshold at 0)
                 bufOut.y[idx] = (val > 0.0) ? val : 0.0;
+            }
+        }
+        "#,
+    }
+}
+mod cs_activate_f16 {
+    vulkano_shaders::shader!{
+        ty: "compute",
+        src: r#"
+        #version 450
+        #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+        #extension GL_EXT_shader_16bit_storage : require
+        layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+        layout(push_constant) uniform Params { uint count; } params;
+        layout(set = 0, binding = 0) readonly buffer In { float16_t x[]; } bufIn;
+        layout(set = 0, binding = 1) writeonly buffer Out { float16_t y[]; } bufOut;
+        void main() {
+            uint idx = gl_GlobalInvocationID.x;
+            if(idx < params.count) {
+                float16_t val = bufIn.x[idx];
+                bufOut.y[idx] = (val > float16_t(0.0)) ? val : float16_t(0.0);
             }
         }
         "#,
@@ -108,6 +156,29 @@ mod cs_reduce {
         "#,
     }
 }
+mod cs_reduce_f16 {
+    vulkano_shaders::shader!{
+        ty: "compute",
+        src: r#"
+        #version 450
+        #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+        #extension GL_EXT_shader_16bit_storage : require
+        layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+        layout(push_constant) uniform Params { uint count; } params;
+        layout(set = 0, binding = 0) readonly buffer In { float16_t data[]; } bufIn;
+        layout(set = 0, binding = 1) writeonly buffer Out { float16_t result[]; } bufOut;
+        void main() {
+              uint gid = gl_GlobalInvocationID.x;
+              if (gid == 0) {
+                  float16_t sum = float16_t(0.0);
+                  for (uint i = 0; i < params.count; ++i)
+                      sum += bufIn.data[i];
+                  bufOut.result[0] = sum;
+              }
+        }
+        "#,
+    }
+}
 
 // 2. Define the World context carrying pipelines and descriptor sets
 struct MyWorld {
@@ -121,7 +192,8 @@ struct MyWorld {
     reduce_desc_set: std::sync::Arc<DescriptorSet>,
     // Push constant data:
     dims: cs_matmul::Params,      // struct { M, N, K }
-    vec_len: u32                     // count of elements for activation/reduction
+    vec_len: u32,                    // count of elements for activation/reduction
+    use_fp16: bool
 }
 
 // 3. Define Task implementations for each stage
@@ -143,7 +215,12 @@ impl Task for MatMulTask {
             &[world.matmul_desc_set.as_raw()],
             &[]
         ).unwrap();
-        cb.push_constants(&world.matmul_pipeline.layout().clone(), 0, &world.dims).unwrap(); // push constants (M,N,K)
+        if world.use_fp16 {
+            let pc = cs_matmul_f16::Params { M: world.dims.M, N: world.dims.N, K: world.dims.K };
+            cb.push_constants(&world.matmul_pipeline.layout().clone(), 0, &pc).unwrap();
+        } else {
+            cb.push_constants(&world.matmul_pipeline.layout().clone(), 0, &world.dims).unwrap();
+        }
         // Determine dispatch size: one thread per output element (M x N threads, grouped in 16x16)
         let (wg_x, wg_y) = ((world.dims.M + 15) / 16, (world.dims.N + 15) / 16);
         cb.dispatch([wg_x, wg_y, 1]).unwrap();
@@ -168,7 +245,11 @@ impl Task for ActivationTask {
             &[]
         ).unwrap();
         let count = world.vec_len;
-        cb.push_constants(&world.activate_pipeline.layout().clone(), 0, &cs_activate::Params { count }).unwrap();
+        if world.use_fp16 {
+            cb.push_constants(&world.activate_pipeline.layout().clone(), 0, &cs_activate_f16::Params { count }).unwrap();
+        } else {
+            cb.push_constants(&world.activate_pipeline.layout().clone(), 0, &cs_activate::Params { count }).unwrap();
+        }
         // Dispatch enough threads for 'count' elements
         let wg_count = (count + 63) / 64;
         cb.dispatch([wg_count, 1, 1]).unwrap();
@@ -193,7 +274,11 @@ impl Task for ReduceTask {
             &[]
         ).unwrap();
         let count = world.vec_len;
-        cb.push_constants(&world.reduce_pipeline.layout().clone(), 0, &cs_reduce::Params { count }).unwrap();
+        if world.use_fp16 {
+            cb.push_constants(&world.reduce_pipeline.layout().clone(), 0, &cs_reduce_f16::Params { count }).unwrap();
+        } else {
+            cb.push_constants(&world.reduce_pipeline.layout().clone(), 0, &cs_reduce::Params { count }).unwrap();
+        }
         // Dispatch (we use one workgroup of 256 threads; ensure enough threads to cover 'count')
         let wg_count = (count + 255) / 256;  // number of groups needed (likely 1 here)
         cb.dispatch([/*wg_count*/1, 1, 1]).unwrap();
@@ -215,15 +300,6 @@ fn main() {
     .unwrap();
 
     // ... select physical device and queue family that supports compute ...
-    let device_extensions = DeviceExtensions {
-        ext_shader_atomic_float: true,   // VK_EXT_shader_atomic_float
-        ..DeviceExtensions::empty()
-    };
-
-    let device_features = DeviceFeatures {
-        //shader_buffer_float32_atomic_add: true,
-        ..DeviceFeatures::empty()
-    };
 
     let (physical_device, queue_family_index) = instance
         .enumerate_physical_devices()
@@ -260,6 +336,22 @@ fn main() {
         physical_device.properties().device_name,
         physical_device.properties().device_type,
     );
+
+    let use_fp16 = physical_device
+        .supported_extensions()
+        .khr_16bit_storage
+        && physical_device.supported_features().shader_float16;
+
+    let device_extensions = DeviceExtensions {
+        ext_shader_atomic_float: true,
+        khr_16bit_storage: use_fp16,
+        ..DeviceExtensions::empty()
+    };
+
+    let device_features = DeviceFeatures {
+        shader_float16: use_fp16,
+        ..DeviceFeatures::empty()
+    };
 
     let (device, mut queues) = Device::new(
         &physical_device,
@@ -299,10 +391,11 @@ fn main() {
     // Assume dimensions:
     // Increase matrix dimensions tenfold to better warm up the GPU
     let m=4096u32; let k=2048u32; let n=1024u32;
-    let len_a = m * k;        // number of floats in A
-    let len_b = k * n;        // number of floats in B
-    let len_c = m * n;        // number of floats in C (also in D after activation)
+    let len_a = m * k;
+    let len_b = k * n;
+    let len_c = m * n;
     // Create GPU buffers (device local) via resources
+    let elem_size = if use_fp16 { std::mem::size_of::<f16>() } else { std::mem::size_of::<f32>() } as DeviceSize;
     let a_id: Id<Buffer> = resources.create_buffer(
         &vulkano::buffer::BufferCreateInfo {
             usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
@@ -310,7 +403,8 @@ fn main() {
         },
         &AllocationCreateInfo::default(),
         DeviceLayout::from_size_alignment(
-            len_a as DeviceSize * std::mem::size_of::<f32>() as DeviceSize, std::mem::align_of::<f32>() as DeviceSize)
+            len_a as DeviceSize * elem_size,
+            if use_fp16 { std::mem::align_of::<f16>() as DeviceSize } else { std::mem::align_of::<f32>() as DeviceSize })
             .unwrap(),
     ).unwrap();
     let b_id: Id<Buffer> = resources.create_buffer(
@@ -320,7 +414,8 @@ fn main() {
         },
         &AllocationCreateInfo::default(),
         DeviceLayout::from_size_alignment(
-            len_b as DeviceSize * std::mem::size_of::<f32>() as DeviceSize, std::mem::align_of::<f32>() as DeviceSize)
+            len_b as DeviceSize * elem_size,
+            if use_fp16 { std::mem::align_of::<f16>() as DeviceSize } else { std::mem::align_of::<f32>() as DeviceSize })
             .unwrap(),
     ).unwrap();
     let c_id: Id<Buffer> = resources.create_buffer(
@@ -330,7 +425,8 @@ fn main() {
         },
         &AllocationCreateInfo::default(),  // default allocation (device local)
         DeviceLayout::from_size_alignment(
-            len_c as DeviceSize * std::mem::size_of::<f32>() as DeviceSize, std::mem::align_of::<f32>() as DeviceSize)
+            len_c as DeviceSize * elem_size,
+            if use_fp16 { std::mem::align_of::<f16>() as DeviceSize } else { std::mem::align_of::<f32>() as DeviceSize })
             .unwrap(),
     ).unwrap();
     let d_id: Id<Buffer> = resources.create_buffer(
@@ -340,7 +436,8 @@ fn main() {
         },
         &AllocationCreateInfo::default(),  // default allocation (device local)
         DeviceLayout::from_size_alignment(
-            len_c as DeviceSize * std::mem::size_of::<f32>() as DeviceSize, std::mem::align_of::<f32>() as DeviceSize)
+            len_c as DeviceSize * elem_size,
+            if use_fp16 { std::mem::align_of::<f16>() as DeviceSize } else { std::mem::align_of::<f32>() as DeviceSize })
             .unwrap(),
     ).unwrap();
     let r_id = resources.create_buffer(
@@ -355,38 +452,71 @@ fn main() {
             ..Default::default()
         },
         DeviceLayout::from_size_alignment(
-            1 * std::mem::size_of::<f32>() as DeviceSize, std::mem::align_of::<f32>() as DeviceSize)
+            elem_size,
+            if use_fp16 { std::mem::align_of::<f16>() as DeviceSize } else { std::mem::align_of::<f32>() as DeviceSize })
             .unwrap(),
     ).unwrap();
     // Fill host-visible portions of A and B with data (for demo, skip actual data fill)
     // In practice, use resources.write_buffer or the Buffer's mapped memory to initialize.
     // create  staging buffer with sequential floats 0,1,2,…
-    let host_a = Buffer::from_iter(
-        &mem_alloc,
-        &BufferCreateInfo {
-            usage: BufferUsage::TRANSFER_SRC,   // only copy-src needed
-            ..Default::default()
-        },
-        &AllocationCreateInfo {
-            memory_type_filter:
-                MemoryTypeFilter::HOST_SEQUENTIAL_WRITE | MemoryTypeFilter::PREFER_HOST,
-            ..Default::default()
-        },
-        (0..len_a).map(|i| i as f32),           // simple pattern
-    ).unwrap();
-    let host_b = Buffer::from_iter(
-        &mem_alloc,
-        &BufferCreateInfo {
-            usage: BufferUsage::TRANSFER_SRC,   // only copy-src needed
-            ..Default::default()
-        },
-        &AllocationCreateInfo {
-            memory_type_filter:
-                MemoryTypeFilter::HOST_SEQUENTIAL_WRITE | MemoryTypeFilter::PREFER_HOST,
-            ..Default::default()
-        },
-        (0..len_b).map(|i| i as f32),           // simple pattern
-    ).unwrap();
+    let host_a = if use_fp16 {
+        Buffer::from_iter(
+            &mem_alloc,
+            &BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_SRC,
+                ..Default::default()
+            },
+            &AllocationCreateInfo {
+                memory_type_filter:
+                    MemoryTypeFilter::HOST_SEQUENTIAL_WRITE | MemoryTypeFilter::PREFER_HOST,
+                ..Default::default()
+            },
+            (0..len_a).map(|i| f16::from_f32(i as f32)),
+        ).unwrap()
+    } else {
+        Buffer::from_iter(
+            &mem_alloc,
+            &BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_SRC,
+                ..Default::default()
+            },
+            &AllocationCreateInfo {
+                memory_type_filter:
+                    MemoryTypeFilter::HOST_SEQUENTIAL_WRITE | MemoryTypeFilter::PREFER_HOST,
+                ..Default::default()
+            },
+            (0..len_a).map(|i| i as f32),
+        ).unwrap()
+    };
+    let host_b = if use_fp16 {
+        Buffer::from_iter(
+            &mem_alloc,
+            &BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_SRC,
+                ..Default::default()
+            },
+            &AllocationCreateInfo {
+                memory_type_filter:
+                    MemoryTypeFilter::HOST_SEQUENTIAL_WRITE | MemoryTypeFilter::PREFER_HOST,
+                ..Default::default()
+            },
+            (0..len_b).map(|i| f16::from_f32(i as f32)),
+        ).unwrap()
+    } else {
+        Buffer::from_iter(
+            &mem_alloc,
+            &BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_SRC,
+                ..Default::default()
+            },
+            &AllocationCreateInfo {
+                memory_type_filter:
+                    MemoryTypeFilter::HOST_SEQUENTIAL_WRITE | MemoryTypeFilter::PREFER_HOST,
+                ..Default::default()
+            },
+            (0..len_b).map(|i| i as f32),
+        ).unwrap()
+    };
 
     // command-buffer copy host_a → a_id  (do once before executing the graph)
     let mut cb = AutoCommandBufferBuilder::primary(
@@ -394,8 +524,13 @@ fn main() {
         queue.queue_family_index(),
         CommandBufferUsage::OneTimeSubmit,
     ).unwrap();
-    let a_slice: Subbuffer<[f32]> = Subbuffer::from(resources.buffer(a_id).unwrap().buffer().clone()).reinterpret();
-    cb.copy_buffer(CopyBufferInfoTyped::new(host_a.clone(), a_slice.clone())).unwrap();
+    if use_fp16 {
+        let a_slice: Subbuffer<[f16]> = Subbuffer::from(resources.buffer(a_id).unwrap().buffer().clone()).reinterpret();
+        cb.copy_buffer(CopyBufferInfoTyped::new(host_a.clone(), a_slice.clone())).unwrap();
+    } else {
+        let a_slice: Subbuffer<[f32]> = Subbuffer::from(resources.buffer(a_id).unwrap().buffer().clone()).reinterpret();
+        cb.copy_buffer(CopyBufferInfoTyped::new(host_a.clone(), a_slice.clone())).unwrap();
+    }
     let cb = cb.build().unwrap();
     let future = sync::now(device.clone())            // start with an idle future
         .then_execute(queue.clone(), cb).unwrap()             // submit to the queue
@@ -408,8 +543,13 @@ fn main() {
         queue.queue_family_index(),
         CommandBufferUsage::OneTimeSubmit,
     ).unwrap();
-    let b_slice: Subbuffer<[f32]> = Subbuffer::from(resources.buffer(b_id).unwrap().buffer().clone()).reinterpret();
-    cb.copy_buffer(CopyBufferInfoTyped::new(host_b.clone(), b_slice.clone())).unwrap();
+    if use_fp16 {
+        let b_slice: Subbuffer<[f16]> = Subbuffer::from(resources.buffer(b_id).unwrap().buffer().clone()).reinterpret();
+        cb.copy_buffer(CopyBufferInfoTyped::new(host_b.clone(), b_slice.clone())).unwrap();
+    } else {
+        let b_slice: Subbuffer<[f32]> = Subbuffer::from(resources.buffer(b_id).unwrap().buffer().clone()).reinterpret();
+        cb.copy_buffer(CopyBufferInfoTyped::new(host_b.clone(), b_slice.clone())).unwrap();
+    }
     let cb = cb.build().unwrap();
     let future = sync::now(device.clone())            // start with an idle future
         .then_execute(queue.clone(), cb).unwrap()             // submit to the queue
@@ -418,7 +558,11 @@ fn main() {
 
     // 7. Build compute pipelines and descriptor sets for each shader
     // (In a real program, pipeline creation and descriptor set writing would be done once at init)
-    let shader_matmul = cs_matmul::load(&device).unwrap().entry_point("main").unwrap();
+    let shader_matmul = if use_fp16 {
+        cs_matmul_f16::load(&device).unwrap().entry_point("main").unwrap()
+    } else {
+        cs_matmul::load(&device).unwrap().entry_point("main").unwrap()
+    };
     let stage_matmul = PipelineShaderStageCreateInfo::new(&shader_matmul);
     let layout_matmul = PipelineLayout::from_stages(&device, slice::from_ref(&stage_matmul)).unwrap();
     let pipeline_matmul = ComputePipeline::new(
@@ -428,7 +572,11 @@ fn main() {
     )
     .unwrap();
 
-    let shader_activate = cs_activate::load(&device).unwrap().entry_point("main").unwrap();
+    let shader_activate = if use_fp16 {
+        cs_activate_f16::load(&device).unwrap().entry_point("main").unwrap()
+    } else {
+        cs_activate::load(&device).unwrap().entry_point("main").unwrap()
+    };
     let stage_activate = PipelineShaderStageCreateInfo::new(&shader_activate);
     let layout_activate = PipelineLayout::from_stages(&device, slice::from_ref(&stage_activate)).unwrap();
     let pipeline_activate = ComputePipeline::new(
@@ -438,7 +586,11 @@ fn main() {
     )
     .unwrap();
 
-    let shader_reduce = cs_reduce::load(&device).unwrap().entry_point("main").unwrap();
+    let shader_reduce = if use_fp16 {
+        cs_reduce_f16::load(&device).unwrap().entry_point("main").unwrap()
+    } else {
+        cs_reduce::load(&device).unwrap().entry_point("main").unwrap()
+    };
     let stage_reduce = PipelineShaderStageCreateInfo::new(&shader_reduce);
     let layout_reduce = PipelineLayout::from_stages(&device, slice::from_ref(&stage_reduce)).unwrap();
     let pipeline_reduce = ComputePipeline::new(
@@ -463,10 +615,24 @@ fn main() {
     let buf_d = binding_d.buffer();  // get Arc<Buffer>
     let binding_r = resources.buffer(r_id).unwrap();
     let buf_r = binding_r.buffer();  // get Arc<Buffer>
-    let r_slice: Subbuffer<[f32]> = Subbuffer::from(buf_r.clone()).reinterpret();
-    {
-        let mut guard = r_slice.write().unwrap();   // BufferWriteGuard<[f32]>
-        guard[0] = 0.0;
+    let r_slice_f16: Option<Subbuffer<[f16]>>;
+    let r_slice_f32: Option<Subbuffer<[f32]>>;
+    if use_fp16 {
+        let slice: Subbuffer<[f16]> = Subbuffer::from(buf_r.clone()).reinterpret();
+        {
+            let mut guard = slice.write().unwrap();
+            guard[0] = f16::from_f32(0.0);
+        }
+        r_slice_f16 = Some(slice);
+        r_slice_f32 = None;
+    } else {
+        let slice: Subbuffer<[f32]> = Subbuffer::from(buf_r.clone()).reinterpret();
+        {
+            let mut guard = slice.write().unwrap();
+            guard[0] = 0.0_f32;
+        }
+        r_slice_f32 = Some(slice);
+        r_slice_f16 = None;
     }
     // Now allocate descriptor sets:
     let set_alloc = Arc::new(StandardDescriptorSetAllocator::new(
@@ -550,7 +716,8 @@ fn main() {
         activate_desc_set: activate_set.clone(),
         reduce_desc_set: reduce_set.clone(),
         dims: cs_matmul::Params { M: m, N: n, K: k },
-        vec_len: (m * n)      // total elements for activation and reduction
+        vec_len: (m * n),      // total elements for activation and reduction
+        use_fp16
     };
 
     // 10. Execute the task graph
@@ -567,9 +734,17 @@ fn main() {
     let gpu_time = start_gpu.elapsed();
     // 11. Retrieve and print result
     // Read the result buffer:
-    let result_guard = r_slice.read().unwrap();   // BufferReadGuard<'_, [f32]>
-    let result_data: &[f32] = &result_guard;       // coerces to &[f32]
-    println!("Sum of all elements in C = {}", result_data[0]);
+    if use_fp16 {
+        let slice = r_slice_f16.as_ref().unwrap();
+        let result_guard = slice.read().unwrap();
+        let result_data: &[f16] = &result_guard;
+        println!("Sum of all elements in C = {}", f32::from(result_data[0]));
+    } else {
+        let slice = r_slice_f32.as_ref().unwrap();
+        let result_guard = slice.read().unwrap();
+        let result_data: &[f32] = &result_guard;
+        println!("Sum of all elements in C = {}", result_data[0]);
+    }
 
     let start_cpu = Instant::now();
     let mut cpu_c = vec![0f32; (m * n) as usize];
