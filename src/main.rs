@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfoTyped};
@@ -578,16 +579,17 @@ fn main() {
     }
     .unwrap();
 
+    let start_gpu = Instant::now();
     unsafe { exec_graph.execute(resource_map, &world, || {}) }.unwrap();
-
-    // 11. Retrieve and print result
-    // Wait for the GPU to finish (since we have only 1 frame in flight, execute has effectively completed).
     unsafe { device.wait_idle() }.unwrap();
+    let gpu_time = start_gpu.elapsed();
+    // 11. Retrieve and print result
     // Read the result buffer:
     let result_guard = r_slice.read().unwrap();   // BufferReadGuard<'_, [f32]>
     let result_data: &[f32] = &result_guard;       // coerces to &[f32]
     println!("Sum of all elements in C = {}", result_data[0]);
 
+    let start_cpu = Instant::now();
     let mut cpu_c = vec![0f32; (m * n) as usize];
     for row in 0..m {
         for col in 0..n {
@@ -599,5 +601,7 @@ fn main() {
         }
     }
     let golden: f32 = cpu_c.iter().sum();
+    let cpu_time = start_cpu.elapsed();
     println!("CPU reference sum = {}", golden);
+    println!("GPU time: {:?}, CPU time: {:?}", gpu_time, cpu_time);
 }
