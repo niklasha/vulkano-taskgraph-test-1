@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::{slice, sync::Arc};
+use std::time::Instant;
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfoTyped};
@@ -10,7 +11,6 @@ use vulkano::device::{
 };
 use vulkano::memory::allocator::{AllocationCreateInfo, DeviceLayout, MemoryTypeFilter, StandardMemoryAllocator, GenericMemoryAllocatorCreateInfo};
 use vulkano::pipeline::compute::ComputePipelineCreateInfo;
-use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::PipelineShaderStageCreateInfo;
 use vulkano::pipeline::{ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout};
 use vulkano::sync::{self, GpuFuture};
@@ -417,51 +417,33 @@ fn main() {
 
     // 7. Build compute pipelines and descriptor sets for each shader
     // (In a real program, pipeline creation and descriptor set writing would be done once at init)
-    let shader_matmul = cs_matmul::load(device.clone()).unwrap();
-    let stage_matmul = PipelineShaderStageCreateInfo::new(shader_matmul.entry_point("main").unwrap());
-    let layout_matmul = PipelineLayout::new(
-        device.clone(),
-        PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage_matmul])
-            .into_pipeline_layout_create_info(device.clone())
-            .unwrap(),
-    )
-    .unwrap();
+    let shader_matmul = cs_matmul::load(&device).unwrap().entry_point("main").unwrap();
+    let stage_matmul = PipelineShaderStageCreateInfo::new(&shader_matmul);
+    let layout_matmul = PipelineLayout::from_stages(&device, slice::from_ref(&stage_matmul)).unwrap();
     let pipeline_matmul = ComputePipeline::new(
-        device.clone(),
+        &device,
         None,
-        ComputePipelineCreateInfo::new(stage_matmul, layout_matmul),
+        &ComputePipelineCreateInfo::new(stage_matmul, &layout_matmul),
     )
     .unwrap();
 
-    let shader_activate = cs_activate::load(device.clone()).unwrap();
-    let stage_activate = PipelineShaderStageCreateInfo::new(shader_activate.entry_point("main").unwrap());
-    let layout_activate = PipelineLayout::new(
-        device.clone(),
-        PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage_activate])
-            .into_pipeline_layout_create_info(device.clone())
-            .unwrap(),
-    )
-    .unwrap();
+    let shader_activate = cs_activate::load(&device).unwrap().entry_point("main").unwrap();
+    let stage_activate = PipelineShaderStageCreateInfo::new(&shader_activate);
+    let layout_activate = PipelineLayout::from_stages(&device, slice::from_ref(&stage_activate)).unwrap();
     let pipeline_activate = ComputePipeline::new(
-        device.clone(),
+        &device,
         None,
-        ComputePipelineCreateInfo::new(stage_activate, layout_activate),
+        &ComputePipelineCreateInfo::new(stage_activate, &layout_activate),
     )
     .unwrap();
 
-    let shader_reduce = cs_reduce::load(device.clone()).unwrap();
-    let stage_reduce = PipelineShaderStageCreateInfo::new(shader_reduce.entry_point("main").unwrap());
-    let layout_reduce = PipelineLayout::new(
-        device.clone(),
-        PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage_reduce])
-            .into_pipeline_layout_create_info(device.clone())
-            .unwrap(),
-    )
-    .unwrap();
+    let shader_reduce = cs_reduce::load(&device).unwrap().entry_point("main").unwrap();
+    let stage_reduce = PipelineShaderStageCreateInfo::new(&shader_reduce);
+    let layout_reduce = PipelineLayout::from_stages(&device, slice::from_ref(&stage_reduce)).unwrap();
     let pipeline_reduce = ComputePipeline::new(
-        device.clone(),
+        &device,
         None,
-        ComputePipelineCreateInfo::new(stage_reduce, layout_reduce),
+        &ComputePipelineCreateInfo::new(stage_reduce, &layout_reduce),
     )
     .unwrap();
     // Create descriptor sets for each pipeline:
@@ -578,16 +560,17 @@ fn main() {
     }
     .unwrap();
 
+    let start_gpu = Instant::now();
     unsafe { exec_graph.execute(resource_map, &world, || {}) }.unwrap();
-
-    // 11. Retrieve and print result
-    // Wait for the GPU to finish (since we have only 1 frame in flight, execute has effectively completed).
     unsafe { device.wait_idle() }.unwrap();
+    let gpu_time = start_gpu.elapsed();
+    // 11. Retrieve and print result
     // Read the result buffer:
     let result_guard = r_slice.read().unwrap();   // BufferReadGuard<'_, [f32]>
     let result_data: &[f32] = &result_guard;       // coerces to &[f32]
     println!("Sum of all elements in C = {}", result_data[0]);
 
+    let start_cpu = Instant::now();
     let mut cpu_c = vec![0f32; (m * n) as usize];
     for row in 0..m {
         for col in 0..n {
@@ -599,5 +582,7 @@ fn main() {
         }
     }
     let golden: f32 = cpu_c.iter().sum();
+    let cpu_time = start_cpu.elapsed();
     println!("CPU reference sum = {}", golden);
+    println!("GPU time: {:?}, CPU time: {:?}", gpu_time, cpu_time);
 }
