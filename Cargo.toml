@@ -8,3 +8,4 @@ edition = "2021"
 vulkano          = { git = "https://github.com/vulkano-rs/vulkano", default-features = false, features = ["macros"] }
 vulkano-shaders  = { git = "https://github.com/vulkano-rs/vulkano", package = "vulkano-shaders" }
 vulkano-taskgraph= { git = "https://github.com/vulkano-rs/vulkano", package = "vulkano-taskgraph" }
+half = "2"
