@@ -298,7 +298,7 @@ fn main() {
     // 6. Allocate buffers for A, B, C, D, and result
     // Assume dimensions:
     // Increase matrix dimensions tenfold to better warm up the GPU
-    let m=10240u32; let k=512u32; let n=256u32;
+    let m=4096u32; let k=2048u32; let n=1024u32;
     let len_a = m * k;        // number of floats in A
     let len_b = k * n;        // number of floats in B
     let len_c = m * n;        // number of floats in C (also in D after activation)
