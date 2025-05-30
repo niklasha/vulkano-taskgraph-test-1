@@ -170,10 +170,11 @@ mod cs_reduce_f16 {
         void main() {
               uint gid = gl_GlobalInvocationID.x;
               if (gid == 0) {
-                  float16_t sum = float16_t(0.0);
+                  float sum = 0.0;
                   for (uint i = 0; i < params.count; ++i)
-                      sum += bufIn.data[i];
-                  bufOut.result[0] = sum;
+                      sum += float(bufIn.data[i]);
+                  float mean = sum / float(params.count);
+                  bufOut.result[0] = float16_t(mean);
               }
         }
         "#,
@@ -755,7 +756,7 @@ fn main() {
         let slice = r_slice_f16.as_ref().unwrap();
         let result_guard = slice.read().unwrap();
         let result_data: &[f16] = &result_guard;
-        println!("Sum of all elements in C = {}", f32::from(result_data[0]));
+        println!("Mean of all elements in C = {}", f32::from(result_data[0]));
     } else {
         let slice = r_slice_f32.as_ref().unwrap();
         let result_guard = slice.read().unwrap();
@@ -774,8 +775,16 @@ fn main() {
             cpu_c[(row*n + col) as usize] = s.max(0.0);        // ReLU
         }
     }
-    let golden: f32 = cpu_c.iter().sum();
+    let golden: f32 = if use_fp16 {
+        cpu_c.iter().copied().sum::<f32>() / (m * n) as f32
+    } else {
+        cpu_c.iter().copied().sum()
+    };
     let cpu_time = start_cpu.elapsed();
-    println!("CPU reference sum = {}", golden);
+    if use_fp16 {
+        println!("CPU reference mean = {}", golden);
+    } else {
+        println!("CPU reference sum = {}", golden);
+    }
     println!("GPU time: {:?}, CPU time: {:?}", gpu_time, cpu_time);
 }
