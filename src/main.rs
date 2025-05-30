@@ -195,7 +195,8 @@ struct MyWorld {
     // Push constant data:
     dims: cs_matmul::Params,      // struct { M, N, K }
     vec_len: u32,                    // count of elements for activation/reduction
-    use_fp16: bool
+    use_fp16: bool,
+    use_wmma: bool,
 }
 
 // 3. Define Task implementations for each stage
@@ -339,20 +340,36 @@ fn main() {
         physical_device.properties().device_type,
     );
 
+    // Check for NVIDIA cooperative matrix (WMMA) support
+    let wmma_supported = physical_device
+        .supported_extensions()
+        .nv_cooperative_matrix
+        || physical_device.supported_extensions().khr_cooperative_matrix;
+
+    if wmma_supported {
+        println!("WMMA/cooperative matrix supported");
+    } else {
+        println!("WMMA/cooperative matrix NOT supported");
+    }
+
     let use_fp16 = physical_device
         .supported_extensions()
         .khr_16bit_storage
-        && physical_device.supported_features().shader_float16;
+        && physical_device.supported_features().shader_float16
+        || wmma_supported;
 
     let device_extensions = DeviceExtensions {
         ext_shader_atomic_float: true,
         khr_16bit_storage: use_fp16,
+        nv_cooperative_matrix: wmma_supported,
+        khr_cooperative_matrix: wmma_supported,
         ..DeviceExtensions::empty()
     };
 
     let device_features = DeviceFeatures {
-	storage_buffer16_bit_access: use_fp16,
+        storage_buffer16_bit_access: use_fp16,
         shader_float16: use_fp16,
+        cooperative_matrix: wmma_supported,
         ..DeviceFeatures::empty()
     };
 
@@ -736,7 +753,8 @@ fn main() {
         reduce_desc_set: reduce_set.clone(),
         dims: cs_matmul::Params { M: m, N: n, K: k },
         vec_len: (m * n),      // total elements for activation and reduction
-        use_fp16
+        use_fp16,
+        use_wmma: wmma_supported,
     };
 
     // 10. Execute the task graph
