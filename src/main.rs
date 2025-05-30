@@ -349,6 +349,7 @@ fn main() {
     };
 
     let device_features = DeviceFeatures {
+	storage_buffer16_bit_access: use_fp16,
         shader_float16: use_fp16,
         ..DeviceFeatures::empty()
     };
