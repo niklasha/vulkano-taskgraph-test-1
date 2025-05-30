@@ -1,0 +1,10 @@
+[package]
+name = "vulkano_taskgraph_linalg"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Track Vulkano master to ensure the latest task-graph & descriptor-set APIs
+vulkano          = { git = "https://github.com/vulkano-rs/vulkano", default-features = false, features = ["macros"] }
+vulkano-shaders  = { git = "https://github.com/vulkano-rs/vulkano", package = "vulkano-shaders" }
+vulkano-taskgraph= { git = "https://github.com/vulkano-rs/vulkano", package = "vulkano-taskgraph" }
