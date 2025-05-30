@@ -280,8 +280,8 @@ impl Task for ReduceTask {
             cb.push_constants(&world.reduce_pipeline.layout().clone(), 0, &cs_reduce::Params { count }).unwrap();
         }
         // Dispatch (we use one workgroup of 256 threads; ensure enough threads to cover 'count')
-        let wg_count = (count + 255) / 256;  // number of groups needed (likely 1 here)
-        cb.dispatch([/*wg_count*/1, 1, 1]).unwrap();
+        let _wg_count = (count + 255) / 256;  // number of groups needed (likely 1 here)
+        cb.dispatch([/*_wg_count*/1, 1, 1]).unwrap();
         Ok(())
     }
 }
@@ -459,8 +459,10 @@ fn main() {
     // Fill host-visible portions of A and B with data (for demo, skip actual data fill)
     // In practice, use resources.write_buffer or the Buffer's mapped memory to initialize.
     // create  staging buffer with sequential floats 0,1,2,…
-    let host_a = if use_fp16 {
-        Buffer::from_iter(
+    let host_a_f16: Option<Subbuffer<[f16]>>;
+    let host_a_f32: Option<Subbuffer<[f32]>>;
+    if use_fp16 {
+        let buf = Buffer::from_iter(
             &mem_alloc,
             &BufferCreateInfo {
                 usage: BufferUsage::TRANSFER_SRC,
@@ -472,9 +474,11 @@ fn main() {
                 ..Default::default()
             },
             (0..len_a).map(|i| f16::from_f32(i as f32)),
-        ).unwrap()
+        ).unwrap();
+        host_a_f16 = Some(buf);
+        host_a_f32 = None;
     } else {
-        Buffer::from_iter(
+        let buf = Buffer::from_iter(
             &mem_alloc,
             &BufferCreateInfo {
                 usage: BufferUsage::TRANSFER_SRC,
@@ -486,10 +490,14 @@ fn main() {
                 ..Default::default()
             },
             (0..len_a).map(|i| i as f32),
-        ).unwrap()
-    };
-    let host_b = if use_fp16 {
-        Buffer::from_iter(
+        ).unwrap();
+        host_a_f32 = Some(buf);
+        host_a_f16 = None;
+    }
+    let host_b_f16: Option<Subbuffer<[f16]>>;
+    let host_b_f32: Option<Subbuffer<[f32]>>;
+    if use_fp16 {
+        let buf = Buffer::from_iter(
             &mem_alloc,
             &BufferCreateInfo {
                 usage: BufferUsage::TRANSFER_SRC,
@@ -501,9 +509,11 @@ fn main() {
                 ..Default::default()
             },
             (0..len_b).map(|i| f16::from_f32(i as f32)),
-        ).unwrap()
+        ).unwrap();
+        host_b_f16 = Some(buf);
+        host_b_f32 = None;
     } else {
-        Buffer::from_iter(
+        let buf = Buffer::from_iter(
             &mem_alloc,
             &BufferCreateInfo {
                 usage: BufferUsage::TRANSFER_SRC,
@@ -515,8 +525,10 @@ fn main() {
                 ..Default::default()
             },
             (0..len_b).map(|i| i as f32),
-        ).unwrap()
-    };
+        ).unwrap();
+        host_b_f32 = Some(buf);
+        host_b_f16 = None;
+    }
 
     // command-buffer copy host_a → a_id  (do once before executing the graph)
     let mut cb = AutoCommandBufferBuilder::primary(
@@ -526,10 +538,12 @@ fn main() {
     ).unwrap();
     if use_fp16 {
         let a_slice: Subbuffer<[f16]> = Subbuffer::from(resources.buffer(a_id).unwrap().buffer().clone()).reinterpret();
-        cb.copy_buffer(CopyBufferInfoTyped::new(host_a.clone(), a_slice.clone())).unwrap();
+        let host = host_a_f16.as_ref().unwrap();
+        cb.copy_buffer(CopyBufferInfoTyped::new(host.clone(), a_slice.clone())).unwrap();
     } else {
         let a_slice: Subbuffer<[f32]> = Subbuffer::from(resources.buffer(a_id).unwrap().buffer().clone()).reinterpret();
-        cb.copy_buffer(CopyBufferInfoTyped::new(host_a.clone(), a_slice.clone())).unwrap();
+        let host = host_a_f32.as_ref().unwrap();
+        cb.copy_buffer(CopyBufferInfoTyped::new(host.clone(), a_slice.clone())).unwrap();
     }
     let cb = cb.build().unwrap();
     let future = sync::now(device.clone())            // start with an idle future
@@ -545,10 +559,12 @@ fn main() {
     ).unwrap();
     if use_fp16 {
         let b_slice: Subbuffer<[f16]> = Subbuffer::from(resources.buffer(b_id).unwrap().buffer().clone()).reinterpret();
-        cb.copy_buffer(CopyBufferInfoTyped::new(host_b.clone(), b_slice.clone())).unwrap();
+        let host = host_b_f16.as_ref().unwrap();
+        cb.copy_buffer(CopyBufferInfoTyped::new(host.clone(), b_slice.clone())).unwrap();
     } else {
         let b_slice: Subbuffer<[f32]> = Subbuffer::from(resources.buffer(b_id).unwrap().buffer().clone()).reinterpret();
-        cb.copy_buffer(CopyBufferInfoTyped::new(host_b.clone(), b_slice.clone())).unwrap();
+        let host = host_b_f32.as_ref().unwrap();
+        cb.copy_buffer(CopyBufferInfoTyped::new(host.clone(), b_slice.clone())).unwrap();
     }
     let cb = cb.build().unwrap();
     let future = sync::now(device.clone())            // start with an idle future
