@@ -62,12 +62,13 @@ mod cs_matmul_f16 {
         void main() {
             uint row = gl_GlobalInvocationID.x;
             uint col = gl_GlobalInvocationID.y;
-            if(row < params.M && col < params.N) {
-                float16_t sum = float16_t(0.0);
-                for(uint k = 0; k < params.K; ++k) {
-                    sum += bufA.a[row * params.K + k] * bufB.b[k * params.N + col];
+            if (row < params.M && col < params.N) {
+                float sum = 0.0;
+                for (uint k = 0; k < params.K; ++k) {
+                    sum += float(bufA.a[row * params.K + k]) * float(bufB.b[k * params.N + col]);
                 }
-                bufC.c[row * params.N + col] = sum;
+                sum = clamp(sum, -65504.0, 65504.0);
+                bufC.c[row * params.N + col] = float16_t(sum);
             }
         }
         "#,
@@ -778,7 +779,10 @@ fn main() {
     let golden: f32 = if use_fp16 {
         cpu_c
             .iter()
-            .map(|x| (*x + 1.0).ln())
+            .map(|x| {
+                let clamped = x.clamp(-65504.0, 65504.0);
+                (clamped + 1.0).ln()
+            })
             .sum::<f32>()
             / (m * n) as f32
     } else {
