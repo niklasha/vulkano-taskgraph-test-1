@@ -172,7 +172,7 @@ mod cs_reduce_f16 {
               if (gid == 0) {
                   float sum = 0.0;
                   for (uint i = 0; i < params.count; ++i)
-                      sum += float(bufIn.data[i]);
+                      sum += log(float(bufIn.data[i]) + 1.0);
                   float mean = sum / float(params.count);
                   bufOut.result[0] = float16_t(mean);
               }
@@ -756,7 +756,7 @@ fn main() {
         let slice = r_slice_f16.as_ref().unwrap();
         let result_guard = slice.read().unwrap();
         let result_data: &[f16] = &result_guard;
-        println!("Mean of all elements in C = {}", f32::from(result_data[0]));
+        println!("Mean log1p of all elements in C = {}", f32::from(result_data[0]));
     } else {
         let slice = r_slice_f32.as_ref().unwrap();
         let result_guard = slice.read().unwrap();
@@ -776,13 +776,17 @@ fn main() {
         }
     }
     let golden: f32 = if use_fp16 {
-        cpu_c.iter().copied().sum::<f32>() / (m * n) as f32
+        cpu_c
+            .iter()
+            .map(|x| (*x + 1.0).ln())
+            .sum::<f32>()
+            / (m * n) as f32
     } else {
         cpu_c.iter().copied().sum()
     };
     let cpu_time = start_cpu.elapsed();
     if use_fp16 {
-        println!("CPU reference mean = {}", golden);
+        println!("CPU reference mean log1p = {}", golden);
     } else {
         println!("CPU reference sum = {}", golden);
     }
