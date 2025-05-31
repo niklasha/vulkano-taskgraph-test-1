@@ -74,6 +74,36 @@ mod cs_matmul_f16 {
         "#,
     }
 }
+mod cs_matmul_wmma {
+    vulkano_shaders::shader!{
+        ty: "compute",
+        src: r#"
+        #version 450
+        #extension GL_KHR_memory_scope_semantics : require
+        #extension GL_NV_cooperative_matrix : require
+        #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+        layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+        layout(push_constant) uniform Params { uint M; uint N; uint K; } params;
+        layout(set = 0, binding = 0) readonly buffer A { float16_t a[]; } bufA;
+        layout(set = 0, binding = 1) readonly buffer B { float16_t b[]; } bufB;
+        layout(set = 0, binding = 2) writeonly buffer C { float16_t c[]; } bufC;
+        void main() {
+            uint row = gl_WorkGroupID.x * 16;
+            uint col = gl_WorkGroupID.y * 16;
+            fcoopmatNV<16, gl_ScopeSubgroup, 16, 16> acc =
+                fcoopmatNV<16, gl_ScopeSubgroup, 16, 16>(0.0);
+            for (uint kk = 0; kk < params.K; kk += 16) {
+                fcoopmatNV<16, gl_ScopeSubgroup, 16, 16> A;
+                fcoopmatNV<16, gl_ScopeSubgroup, 16, 16> B;
+                coopMatLoadNV(A, bufA.a, row * params.K + kk, params.K, true);
+                coopMatLoadNV(B, bufB.b, kk * params.N + col, params.N, true);
+                acc = coopMatMulAddNV(A, B, acc);
+            }
+            coopMatStoreNV(acc, bufC.c, row * params.N + col, params.N, true);
+        }
+        "#,
+    }
+}
 mod cs_activate {
     vulkano_shaders::shader!{
         ty: "compute",
@@ -195,7 +225,8 @@ struct MyWorld {
     // Push constant data:
     dims: cs_matmul::Params,      // struct { M, N, K }
     vec_len: u32,                    // count of elements for activation/reduction
-    use_fp16: bool
+    use_fp16: bool,
+    use_wmma: bool,
 }
 
 // 3. Define Task implementations for each stage
@@ -217,7 +248,10 @@ impl Task for MatMulTask {
             &[world.matmul_desc_set.as_raw()],
             &[]
         ).unwrap();
-        if world.use_fp16 {
+        if world.use_wmma {
+            let pc = cs_matmul_wmma::Params { M: world.dims.M, N: world.dims.N, K: world.dims.K };
+            cb.push_constants(&world.matmul_pipeline.layout().clone(), 0, &pc).unwrap();
+        } else if world.use_fp16 {
             let pc = cs_matmul_f16::Params { M: world.dims.M, N: world.dims.N, K: world.dims.K };
             cb.push_constants(&world.matmul_pipeline.layout().clone(), 0, &pc).unwrap();
         } else {
@@ -339,20 +373,36 @@ fn main() {
         physical_device.properties().device_type,
     );
 
+    // Check for NVIDIA cooperative matrix (WMMA) support
+    let wmma_supported = physical_device
+        .supported_extensions()
+        .nv_cooperative_matrix
+        || physical_device.supported_extensions().khr_cooperative_matrix;
+
+    if wmma_supported {
+        println!("WMMA/cooperative matrix supported");
+    } else {
+        println!("WMMA/cooperative matrix NOT supported");
+    }
+
     let use_fp16 = physical_device
         .supported_extensions()
         .khr_16bit_storage
-        && physical_device.supported_features().shader_float16;
+        && physical_device.supported_features().shader_float16
+        || wmma_supported;
 
     let device_extensions = DeviceExtensions {
         ext_shader_atomic_float: true,
         khr_16bit_storage: use_fp16,
+        nv_cooperative_matrix: wmma_supported,
+        khr_cooperative_matrix: wmma_supported,
         ..DeviceExtensions::empty()
     };
 
     let device_features = DeviceFeatures {
-	storage_buffer16_bit_access: use_fp16,
+        storage_buffer16_bit_access: use_fp16,
         shader_float16: use_fp16,
+        cooperative_matrix: wmma_supported,
         ..DeviceFeatures::empty()
     };
 
@@ -577,7 +627,9 @@ fn main() {
 
     // 7. Build compute pipelines and descriptor sets for each shader
     // (In a real program, pipeline creation and descriptor set writing would be done once at init)
-    let shader_matmul = if use_fp16 {
+    let shader_matmul = if wmma_supported {
+        cs_matmul_wmma::load(&device).unwrap().entry_point("main").unwrap()
+    } else if use_fp16 {
         cs_matmul_f16::load(&device).unwrap().entry_point("main").unwrap()
     } else {
         cs_matmul::load(&device).unwrap().entry_point("main").unwrap()
@@ -736,7 +788,8 @@ fn main() {
         reduce_desc_set: reduce_set.clone(),
         dims: cs_matmul::Params { M: m, N: n, K: k },
         vec_len: (m * n),      // total elements for activation and reduction
-        use_fp16
+        use_fp16,
+        use_wmma: wmma_supported,
     };
 
     // 10. Execute the task graph
